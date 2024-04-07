@@ -4,13 +4,23 @@ import math
 from einops import repeat
 
 
+class NewGELU(nn.Module):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+
 class Attention(nn.Module):
-    def __init__(self, dim: int, heads: int, hidden_dim: int, capacity: float):
+    def __init__(self, dim: int, hidden_dim: int, capacity: float):
         super(Attention, self).__init__()
         self.dim = dim
         self.capacity = capacity
         self.router = nn.Linear(dim, 1)
-        self.inner_dim = hidden_dim // heads
+        self.inner_dim = hidden_dim
 
         self.scale = 1 / torch.sqrt(torch.tensor(self.inner_dim, dtype=torch.float32))
         self.to_q = nn.Linear(dim, self.inner_dim, bias=False)
@@ -18,14 +28,9 @@ class Attention(nn.Module):
         self.to_v = nn.Linear(dim, self.inner_dim, bias=False)
         self.to_out = nn.Linear(self.inner_dim, dim)
 
-    def forward(self, x):
+    def forward(self, x, select_x_mask, router_k, topk_index):
         b, l, d = x.size()
-        router_weight = self.router(x).squeeze(2)
-        router_k = math.ceil(l * self.capacity)
-        topk_value, topk_index = torch.topk(router_weight, k=router_k, dim=1, sorted=True)
-        topk_value_last = topk_value[:, -1].view(b, 1).repeat(1, l)  # b,l
-        _select_x_mask = router_weight >= topk_value_last  # b,l
-        select_x_mask = repeat(_select_x_mask, 'b l -> b l d', d=d)
+
         select_x = torch.masked_select(x, select_x_mask).view(b, router_k, d)
         output = torch.zeros(b, l, d)
         q_weight = self.to_q.weight.view(1, self.inner_dim, self.dim).repeat(b, 1, 1)
@@ -47,4 +52,34 @@ class Attention(nn.Module):
         return output
 
 
+class Block(nn.Module):
 
+    def __init__(self, dim, inner_dim, capacity, resid_pdrop):
+        super().__init__()
+        self.router = nn.Linear(dim, 1)
+
+        self.ln_1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, inner_dim, capacity)
+        self.ln_2 = nn.LayerNorm(dim)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc=nn.Linear(dim, 4 * dim),
+            c_proj=nn.Linear(4 * dim, dim),
+            act=NewGELU(),
+            dropout=nn.Dropout(resid_pdrop),
+        ))
+        m = self.mlp
+        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x))))  # MLP forward
+
+    def forward(self, x):
+        b, l, d = x.size()
+
+        router_weight = self.router(x).squeeze(2)
+        router_k = math.ceil(l * self.capacity)
+        topk_value, topk_index = torch.topk(router_weight, k=router_k, dim=1, sorted=True)
+        topk_value_last = topk_value[:, -1].view(b, 1).repeat(1, l)  # b,l
+        _select_x_mask = router_weight >= topk_value_last  # b,l
+        select_x_mask = repeat(_select_x_mask, 'b l -> b l d', d=d)
+
+        x = x + self.attn(self.ln_1(x), select_x_mask, router_k, topk_index)
+        x = x + self.mlpf(self.ln_2(x))
+        return x
